@@ -612,6 +612,93 @@ unsafe fn check_acl_for_write(acl: *const ACL, user_sid: &str, group_sids: &[Str
     false
 }
 
+/// Enumerate shares across all computers in parallel
+///
+/// # Arguments
+/// * `computers` - List of computer names/IPs to enumerate
+/// * `args` - Command-line arguments
+/// * `output` - Output sink (shared across tasks)
+///
+/// # Returns
+/// * `Ok(())` when all enumeration completes
+pub async fn get_all_shares(
+    computers: Vec<String>,
+    args: std::sync::Arc<crate::options::Arguments>,
+    output: std::sync::Arc<OutputSink>,
+) -> Result<(), ShareError> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    if computers.is_empty() {
+        tracing::warn!("No computers to enumerate");
+        return Ok(());
+    }
+
+    eprintln!("[+] Starting share enumeration against {} hosts\n", computers.len());
+
+    // Create status tracker
+    let status = Arc::new(crate::status::Status::new(computers.len()));
+
+    // Start status timer
+    let status_timer = Arc::clone(&status).start_timer();
+
+    // Create semaphore for concurrency control
+    let semaphore = Arc::new(Semaphore::new(args.threads));
+
+    // Spawn tasks for each computer
+    let mut tasks = Vec::with_capacity(computers.len());
+
+    for computer in computers {
+        let args_clone = Arc::clone(&args);
+        let output_clone = Arc::clone(&output);
+        let status_clone = Arc::clone(&status);
+        let semaphore_clone = Arc::clone(&semaphore);
+
+        let task = tokio::spawn(async move {
+            // Acquire semaphore permit (limits concurrency)
+            let _permit = semaphore_clone.acquire().await.unwrap();
+
+            // Choose stealth or full enumeration based on flag
+            let result = if args_clone.stealth {
+                get_computer_shares_stealth(
+                    &computer,
+                    &args_clone,
+                    &output_clone,
+                    &status_clone,
+                ).await
+            } else {
+                get_computer_shares_full(
+                    &computer,
+                    &args_clone,
+                    &output_clone,
+                    &status_clone,
+                ).await
+            };
+
+            if let Err(e) = result {
+                tracing::error!("Error enumerating {}: {}", computer, e);
+            }
+        });
+
+        tasks.push(task);
+    }
+
+    // Wait for all tasks to complete
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    // Stop status timer
+    status_timer.abort();
+
+    // Print final status
+    status.print_final();
+
+    eprintln!("[+] Finished Enumerating Shares");
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
