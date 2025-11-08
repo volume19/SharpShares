@@ -184,6 +184,93 @@ unsafe fn pwstr_to_string(pwstr: PWSTR) -> Option<String> {
     os_string.into_string().ok()
 }
 
+/// Output destination for share enumeration results
+pub enum OutputSink {
+    /// Write to stdout
+    Stdout,
+    /// Write to a file (thread-safe)
+    File(std::sync::Arc<tokio::sync::Mutex<std::fs::File>>),
+}
+
+impl OutputSink {
+    /// Write a line to the output sink (thread-safe)
+    pub async fn write_line(&self, line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        match self {
+            OutputSink::Stdout => {
+                println!("{}", line);
+                Ok(())
+            }
+            OutputSink::File(file) => {
+                let mut f = file.lock().await;
+                writeln!(f, "{}", line)?;
+                f.flush()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Enumerate shares on a single computer (stealth mode - no permission checks)
+///
+/// # Arguments
+/// * `computer` - Computer name or IP address
+/// * `args` - Command-line arguments (filter, stealth, verbose, etc.)
+/// * `output` - Where to write results
+/// * `status` - Progress tracker
+///
+/// # Returns
+/// * `Ok(())` if enumeration completed (even with errors)
+/// * `Err(ShareError)` only on critical failures
+pub async fn get_computer_shares_stealth(
+    computer: &str,
+    args: &crate::options::Arguments,
+    output: &OutputSink,
+    status: &crate::status::Status,
+) -> Result<(), ShareError> {
+    // Error codes to skip (not found, access denied)
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_BAD_NETPATH: i32 = 53;
+
+    // Enumerate shares
+    let shares = enum_net_shares(computer)?;
+
+    // Check if we got an error response
+    if shares.len() == 1 && shares[0].is_error() {
+        let err_code = shares[0].error_code().unwrap_or(0);
+        // Silently skip common errors (access denied, network path not found)
+        if err_code == ERROR_ACCESS_DENIED || err_code == ERROR_BAD_NETPATH {
+            status.increment();
+            return Ok(());
+        }
+        // Log other errors if verbose
+        if args.verbose {
+            tracing::warn!("Error enumerating {}: code {}", computer, err_code);
+        }
+        status.increment();
+        return Ok(());
+    }
+
+    // Filter and output shares
+    for share in shares {
+        // Skip if in filter list (case-insensitive)
+        if args.filter.iter().any(|f| f.eq_ignore_ascii_case(&share.netname)) {
+            continue;
+        }
+
+        // In stealth mode, just list without permission checks
+        let line = format!("[?] \\\\{}\\{}", computer, share.netname);
+        if let Err(e) = output.write_line(&line).await {
+            tracing::error!("Failed to write output: {}", e);
+        }
+    }
+
+    // Increment completion counter
+    status.increment();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +333,42 @@ mod tests {
         // Should be error 53 (network path not found) or 1231 (network location cannot be reached)
         let err_code = shares[0].error_code().unwrap();
         assert!(err_code == 53 || err_code == 1231, "Expected error 53 or 1231, got {}", err_code);
+    }
+
+    #[tokio::test]
+    async fn test_output_sink_stdout() {
+        let sink = OutputSink::Stdout;
+        let result = sink.write_line("test").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_output_sink_file() {
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+
+        let sink = OutputSink::File(std::sync::Arc::new(tokio::sync::Mutex::new(file)));
+        sink.write_line("test line 1").await.unwrap();
+        sink.write_line("test line 2").await.unwrap();
+
+        drop(sink); // Close file
+
+        let mut contents = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        assert!(contents.contains("test line 1"));
+        assert!(contents.contains("test line 2"));
     }
 }
