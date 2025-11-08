@@ -1,0 +1,28 @@
+[package]
+name = "sharpshares"
+version = "0.1.0"
+edition = "2021"
+authors = ["SharpShares Rust Port"]
+license = "MIT OR Apache-2.0"
+description = "Network share enumeration tool for Windows Active Directory environments"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1.40", features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_NetworkManagement_NetManagement", "Win32_Security", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3.12"
+
+[[bin]]
+name = "sharpshares"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
