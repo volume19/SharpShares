@@ -271,6 +271,347 @@ pub async fn get_computer_shares_stealth(
     Ok(())
 }
 
+/// Enumerate shares on a single computer with full permission checks
+///
+/// Tests read and write permissions on each share and outputs accordingly.
+/// Requires Windows APIs for permission checking.
+///
+/// # Arguments
+/// * `computer` - Computer name or IP address
+/// * `args` - Command-line arguments
+/// * `output` - Where to write results
+/// * `status` - Progress tracker
+#[cfg(windows)]
+pub async fn get_computer_shares_full(
+    computer: &str,
+    args: &crate::options::Arguments,
+    output: &OutputSink,
+    status: &crate::status::Status,
+) -> Result<(), ShareError> {
+    use std::path::Path;
+
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_BAD_NETPATH: i32 = 53;
+
+    // Enumerate shares
+    let shares = enum_net_shares(computer)?;
+
+    // Check if we got an error response
+    if shares.len() == 1 && shares[0].is_error() {
+        let err_code = shares[0].error_code().unwrap_or(0);
+        if err_code == ERROR_ACCESS_DENIED || err_code == ERROR_BAD_NETPATH {
+            status.increment();
+            return Ok(());
+        }
+        if args.verbose {
+            tracing::warn!("Error enumerating {}: code {}", computer, err_code);
+        }
+        status.increment();
+        return Ok(());
+    }
+
+    let mut readable_shares = Vec::new();
+    let mut writeable_shares = Vec::new();
+    let mut unauthorized_shares = Vec::new();
+
+    // Get current user info once for all shares
+    let (user_sid, group_sids) = match get_current_user_and_groups() {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::error!("Failed to get user info: {}", e);
+            status.increment();
+            return Ok(());
+        }
+    };
+
+    // Check each share
+    for share in shares {
+        // Skip if in filter list
+        if args.filter.iter().any(|f| f.eq_ignore_ascii_case(&share.netname)) {
+            continue;
+        }
+
+        let unc_path = format!("\\\\{}\\{}", computer, share.netname);
+
+        // Try to test read access
+        match test_read_access(&unc_path) {
+            Ok(true) => {
+                readable_shares.push(share.netname.clone());
+
+                // Check for write access
+                if check_write_permission(&unc_path, &user_sid, &group_sids) {
+                    writeable_shares.push(share.netname.clone());
+                }
+            }
+            Ok(false) => {
+                unauthorized_shares.push(share.netname);
+            }
+            Err(e) => {
+                tracing::debug!("Error checking {}: {}", unc_path, e);
+                unauthorized_shares.push(share.netname);
+            }
+        }
+    }
+
+    // Output readable shares
+    for share in readable_shares {
+        let line = format!("[r] \\\\{}\\{}", computer, share);
+        let _ = output.write_line(&line).await;
+    }
+
+    // Output writeable shares
+    for share in writeable_shares {
+        let line = format!("[w] \\\\{}\\{}", computer, share);
+        let _ = output.write_line(&line).await;
+    }
+
+    // Output unauthorized shares if verbose
+    if args.verbose {
+        for share in unauthorized_shares {
+            let line = format!("[-] \\\\{}\\{}", computer, share);
+            let _ = output.write_line(&line).await;
+        }
+    }
+
+    status.increment();
+    Ok(())
+}
+
+/// Stub for non-Windows platforms
+#[cfg(not(windows))]
+pub async fn get_computer_shares_full(
+    computer: &str,
+    args: &crate::options::Arguments,
+    output: &OutputSink,
+    status: &crate::status::Status,
+) -> Result<(), ShareError> {
+    // Fallback to stealth mode on non-Windows
+    get_computer_shares_stealth(computer, args, output, status).await
+}
+
+/// Test if we can read from a share by listing directory contents
+#[cfg(windows)]
+fn test_read_access(path: &str) -> Result<bool, std::io::Error> {
+    match std::fs::read_dir(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Get current user SID and group SIDs
+#[cfg(windows)]
+fn get_current_user_and_groups() -> Result<(String, Vec<String>), ShareError> {
+    use windows::Win32::Foundation::*;
+    use windows::Win32::Security::*;
+    use windows::Win32::System::Threading::*;
+
+    unsafe {
+        let mut token_handle = HANDLE::default();
+
+        // Get current process token
+        if !OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY,
+            &mut token_handle,
+        ).is_ok() {
+            return Err(ShareError::NetApi(-1));
+        }
+
+        // Get user SID
+        let mut user_buffer = vec![0u8; 256];
+        let mut return_length = 0u32;
+
+        let _ = GetTokenInformation(
+            token_handle,
+            TokenUser,
+            Some(user_buffer.as_mut_ptr() as *mut _),
+            user_buffer.len() as u32,
+            &mut return_length,
+        );
+
+        if return_length > user_buffer.len() as u32 {
+            user_buffer.resize(return_length as usize, 0);
+            if !GetTokenInformation(
+                token_handle,
+                TokenUser,
+                Some(user_buffer.as_mut_ptr() as *mut _),
+                user_buffer.len() as u32,
+                &mut return_length,
+            ).is_ok() {
+                CloseHandle(token_handle);
+                return Err(ShareError::NetApi(-2));
+            }
+        }
+
+        let token_user = &*(user_buffer.as_ptr() as *const TOKEN_USER);
+        let user_sid = sid_to_string(token_user.User.Sid)?;
+
+        // Get group SIDs
+        let mut groups_buffer = vec![0u8; 1024];
+        return_length = 0;
+
+        let _ = GetTokenInformation(
+            token_handle,
+            TokenGroups,
+            Some(groups_buffer.as_mut_ptr() as *mut _),
+            groups_buffer.len() as u32,
+            &mut return_length,
+        );
+
+        if return_length > groups_buffer.len() as u32 {
+            groups_buffer.resize(return_length as usize, 0);
+            if !GetTokenInformation(
+                token_handle,
+                TokenGroups,
+                Some(groups_buffer.as_mut_ptr() as *mut _),
+                groups_buffer.len() as u32,
+                &mut return_length,
+            ).is_ok() {
+                CloseHandle(token_handle);
+                return Err(ShareError::NetApi(-3));
+            }
+        }
+
+        let token_groups = &*(groups_buffer.as_ptr() as *const TOKEN_GROUPS);
+        let mut group_sids = Vec::new();
+
+        for i in 0..token_groups.GroupCount {
+            let group = &token_groups.Groups[i as usize];
+            if let Ok(sid_str) = sid_to_string(group.Sid) {
+                group_sids.push(sid_str);
+            }
+        }
+
+        CloseHandle(token_handle);
+        Ok((user_sid, group_sids))
+    }
+}
+
+/// Convert Windows SID to string representation
+#[cfg(windows)]
+unsafe fn sid_to_string(sid: PSID) -> Result<String, ShareError> {
+    use windows::Win32::Security::*;
+    use windows::core::PWSTR;
+
+    let mut sid_string = PWSTR::null();
+
+    if !ConvertSidToStringSidW(sid, &mut sid_string).is_ok() {
+        return Err(ShareError::StringConversion);
+    }
+
+    let result = pwstr_to_string(sid_string)
+        .ok_or(ShareError::StringConversion)?;
+
+    // Free the string allocated by ConvertSidToStringSidW
+    let _ = windows::Win32::System::Memory::LocalFree(
+        windows::Win32::Foundation::HLOCAL(sid_string.0 as isize)
+    );
+
+    Ok(result)
+}
+
+/// Check if current user has write permission on a path
+#[cfg(windows)]
+fn check_write_permission(path: &str, user_sid: &str, group_sids: &[String]) -> bool {
+    use windows::Win32::Storage::FileSystem::*;
+    use windows::Win32::Security::Authorization::*;
+    use windows::Win32::Security::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe {
+        // Convert path to wide string
+        let path_wide: Vec<u16> = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut sd_ptr: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+
+        // Get security descriptor
+        let result = GetNamedSecurityInfoW(
+            windows::core::PCWSTR(path_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl_ptr),
+            None,
+            &mut sd_ptr,
+        );
+
+        if result != 0 {
+            return false;
+        }
+
+        // Check ACL for write permissions
+        let has_write = if !dacl_ptr.is_null() {
+            check_acl_for_write(dacl_ptr, user_sid, group_sids)
+        } else {
+            false
+        };
+
+        // Free security descriptor
+        if !sd_ptr.is_null() {
+            let _ = windows::Win32::System::Memory::LocalFree(
+                windows::Win32::Foundation::HLOCAL(sd_ptr as isize)
+            );
+        }
+
+        has_write
+    }
+}
+
+/// Check ACL entries for write permissions
+#[cfg(windows)]
+unsafe fn check_acl_for_write(acl: *const ACL, user_sid: &str, group_sids: &[String]) -> bool {
+    use windows::Win32::Security::*;
+
+    if acl.is_null() {
+        return false;
+    }
+
+    let acl_ref = &*acl;
+
+    for i in 0..acl_ref.AceCount {
+        let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        if !GetAce(acl, i as u32, &mut ace_ptr).is_ok() {
+            continue;
+        }
+
+        let ace_header = &*(ace_ptr as *const ACE_HEADER);
+
+        // Only check ACCESS_ALLOWED_ACE
+        if ace_header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+
+        let access_ace = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
+
+        // Check if this ACE grants write permissions
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+        const GENERIC_WRITE: u32 = 0x40000000;
+
+        if (access_ace.Mask & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) == 0 {
+            continue;
+        }
+
+        // Get SID from ACE
+        let ace_sid = PSID(&access_ace.SidStart as *const _ as *mut _);
+        if let Ok(ace_sid_str) = sid_to_string(ace_sid) {
+            // Check if SID matches user or any group
+            if ace_sid_str == user_sid || group_sids.contains(&ace_sid_str) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
