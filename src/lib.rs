@@ -4,3 +4,4 @@
 pub mod options;
 pub mod error;
 pub mod status;
+pub mod shares;
