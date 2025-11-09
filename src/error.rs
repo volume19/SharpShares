@@ -4,7 +4,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum ArgsError {
-    #[error("Must specify hosts using --ldap or --ou")]
+    #[error("Must specify hosts using --ldap, --ou, or --hosts")]
     MissingTargetSpec,
 
     #[error("Failed to create output file: {0}")]

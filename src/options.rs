@@ -51,6 +51,10 @@ pub struct Arguments {
     /// Confirm you have authorization to run this tool
     #[arg(long, default_value = "false")]
     pub i_have_authorization: bool,
+
+    /// Comma-separated list of hosts to enumerate (for testing without LDAP)
+    #[arg(long, value_delimiter = ',')]
+    pub hosts: Vec<String>,
 }
 
 impl Arguments {
@@ -67,8 +71,8 @@ impl Arguments {
             ));
         }
 
-        // Must specify ldap OR ou
-        if self.ldap.is_none() && self.ou.is_none() {
+        // Must specify ldap, ou, OR hosts
+        if self.ldap.is_none() && self.ou.is_none() && self.hosts.is_empty() {
             return Err(ArgsError::MissingTargetSpec);
         }
 
